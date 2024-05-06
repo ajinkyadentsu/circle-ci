@@ -1,0 +1,784 @@
+version: 2.1
+
+setup: <<pipeline.parameters.run-setup>>
+
+parameters:
+ run-setup:
+  type: boolean
+  default: true
+  description: 'Whether to run the setup workflow'
+ native:
+  type: boolean
+  default: false
+ backend:
+  type: boolean
+  default: false
+ web:
+  type: boolean
+  default: false
+ migration:
+  type: boolean
+  default: false
+ environment:
+  type: string
+  default: 'DEVELOP'
+  description: 'Environment to deploy to'
+ version:
+  type: string
+  default: ''
+  description: 'Version to deploy'
+ app:
+  type: string
+  default: ''
+  description: 'App to deploy to selected environment'
+
+orbs:
+ path-filtering: circleci/path-filtering@1.0.0
+ gcp-gcr: circleci/gcp-gcr@0.16.2
+
+commands:
+ build-and-push-web-cmd:
+  parameters:
+   environment:
+    default: 'DEVELOP'
+    type: string
+   image_name:
+    default: 'dfm-web-develop'
+    type: string
+  steps:
+   - gcp-gcr/build-image:
+      image: << parameters.image_name >>
+      no_output_timeout: 20m
+      dockerfile: dockerfile.web
+      registry-url: us-docker.pkg.dev/${PROD_PROJECT_ID}/neat-docker
+      tag: latest
+      google-project-id: PROD_PROJECT_ID
+      extra_build_args: |
+       --build-arg NEXT_PUBLIC_GRAPHQL_URI=${NEXT_PUBLIC_GRAPHQL_URI_<< parameters.environment >>} \
+       --build-arg NEXT_PUBLIC_FIREBASE_API_KEY=${NEXT_PUBLIC_FIREBASE_API_KEY_<< parameters.environment >>} \
+       --build-arg NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=${NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN_<< parameters.environment >>} \
+       --build-arg NEXT_PUBLIC_FIREBASE_TENANT_ID=${NEXT_PUBLIC_FIREBASE_TENANT_ID_<< parameters.environment >>} \
+   - gcp-gcr/push-image:
+      digest-path: /tmp/digest.txt
+      image: << parameters.image_name >>
+      registry-url: us-docker.pkg.dev/${PROD_PROJECT_ID}/neat-docker
+      tag: latest
+      google-project-id: PROD_PROJECT_ID
+
+ deploy-cmd:
+  parameters:
+   environment:
+    default: 'DEVELOP'
+    type: string
+   version:
+    default: 'null'
+    type: string
+   application:
+    default: 'be'
+    type: string
+  steps:
+   - run:
+      name: Deploy to Cloud Run
+      command: |
+       env=$(echo << parameters.environment >> | tr '[:upper:]' '[:lower:]')
+       image=$([[ "<< parameters.application >>" == "be" ]] && echo "dfm-backend" || echo "dfm-web-$env")
+       echo "Selected Image: $image"
+       echo ${<< parameters.environment >>_CI_SERVICE_KEY} > /tmp/key.json
+       gcloud auth activate-service-account --key-file=/tmp/key.json
+       gcloud config set project ${<< parameters.environment >>_PROJECT_ID}
+       regions=("us-west2" "us-east4")
+       # Loop through the regions
+       for region in "${regions[@]}"; do
+         # Deploy to Cloud Run in the current region
+        gcloud config set run/region ${region}
+        echo "Deploying to ${region} region"
+        gcloud run deploy neat-<< parameters.application >>-${region}-${env} \
+            --image=us-docker.pkg.dev/${PROD_PROJECT_ID}/neat-docker/${PROD_PROJECT_ID}/${image}:<< parameters.version >> \
+            --platform=managed \
+            --region=${region} &
+       done
+
+ db-migration-cmd:
+  parameters:
+   environment:
+    default: 'DEVELOP'
+    type: string
+  steps:
+   - checkout
+   - run:
+      name: Install Node & Yarn
+      command: |
+       apk update && apk add --no-cache curl bash jq
+       apk add --update nodejs npm
+       npm install -g yarn
+       yarn set version 3.6.1
+   - run:
+      name: Run Prisma Migration
+      command: |
+       # gcloud config set 'core/enable_feature_flags' false
+       echo ${<< parameters.environment >>_CI_SERVICE_KEY} > /tmp/key.json
+       gcloud auth activate-service-account --key-file=/tmp/key.json
+       gcloud config set project $<< parameters.environment >>_PROJECT_ID
+       gcloud config set run/region us-central1
+       curl -o cloud_sql_proxy https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/$CLOUD_SQL_PROXY_VERSION/cloud-sql-proxy.linux.amd64
+       chmod +x ./cloud_sql_proxy
+       ./cloud_sql_proxy $<< parameters.environment >>_INSTANCE_CONNECTION_NAME --credentials-file /tmp/key.json --debug &
+       sleep 5
+       export DATABASE_URL=$(gcloud secrets versions access latest --secret="sql-proxy-url")
+       echo $DATABASE_URL
+       yarn plugin import workspace-tools
+       yarn workspaces focus prisma-config
+       cd packages/prisma-config
+       DATABASE_URL="$DATABASE_URL" yarn prisma migrate deploy --schema=./src/schema.prisma
+       DATABASE_URL="$DATABASE_URL" yarn prisma generate --schema=./src/schema.prisma
+       DATABASE_URL="$DATABASE_URL" yarn prisma db seed
+
+ get-next-variables-cmd:
+  parameters:
+   environment:
+    default: 'DEVELOP'
+    type: string
+  steps:
+   - run:
+      name: get next vars
+      command: |
+       echo ${<< parameters.environment >>_CI_SERVICE_KEY} > /tmp/key.json
+       gcloud auth activate-service-account --key-file=/tmp/key.json
+       gcloud config set project $<< parameters.environment >>_PROJECT_ID
+       bash .circleci/set-next-env-vars.sh
+
+jobs:
+ android-build-and-distribute:
+  circleci_ip_ranges: true
+  docker:
+   - image: cimg/android:2024.01.1-node
+  environment:
+   DEPLOY_ENV: << pipeline.parameters.environment >>
+   DEPLOY_VERSION: << pipeline.parameters.version >>
+  steps:
+   - checkout:
+      path: ~/project
+
+   - attach_workspace:
+      at: ~/project
+
+   - restore_cache:
+      name: Restore Yarn Package Cache
+      keys:
+       - yarn-packages-{{ checksum "yarn.lock" }}
+
+   - run:
+      name: Install ninja build
+      command: |
+       sudo apt install ninja-build
+       sudo ln -s /usr/bin/ninja /usr/bin/ninja-build
+
+   - run:
+      name: Download appcenter
+      command: sudo npm install appcenter-cli -g
+
+   - run:
+      name: Get ENV VARs from GCloud
+      command: |
+       # Get environment name for GCloud
+       if [ "$DEPLOY_ENV" = "PROD" ]; then
+          GCP_ENV="PROD"
+       elif [ "$DEPLOY_ENV" = "STAGE" ]; then
+          GCP_ENV="STAGE"
+       else # uses develop
+          GCP_ENV="DEVELOP"
+       fi
+       ENV_KEY_NAME="${GCP_ENV}_CI_SERVICE_KEY"
+       ENV_PROJECT_ID="${GCP_ENV}_PROJECT_ID"
+       echo ${!ENV_KEY_NAME} > /tmp/key.json
+       gcloud auth activate-service-account --key-file=/tmp/key.json
+       gcloud config set project ${!ENV_PROJECT_ID}
+       gcloud secrets versions access latest --secret="native-deployment-env-vars" > temp_secret.env
+
+   - run:
+      name: build android
+      command: |
+       cat temp_secret.env >> ~/project/apps/native-apps/.env
+       cd ~
+       mkdir -p out
+       cd project
+       yarn && yarn build:packages
+       TIMESTAMP=$(date +%s)
+       cd apps/native-apps/android
+       # only changes build number for develop branch builds
+       if [ "$CIRCLE_BRANCH" = "develop" ]; then
+          sed -i "s|versionCode.*|versionCode ${TIMESTAMP}|g" app/build.gradle
+       fi
+
+       # decode firebase google service files
+       if [ "$DEPLOY_ENV" = "PROD" ]; then
+         echo ${FIREBASE_PROD_GOOGLE_SERVICES_JSON} > app/google-services.txt
+         base64 -d app/google-services.txt > app/google-services.json
+       elif [ "$DEPLOY_ENV" = "STAGE" ]; then
+         echo ${FIREBASE_STAGE_GOOGLE_SERVICES_JSON} > app/google-services.txt
+         base64 -d app/google-services.txt > app/google-services.json
+       fi
+
+       source ~/project/apps/native-apps/.env
+       sed -i "s|<string moduleConfig=\"true\" name=\"CodePushDeploymentKey\">.*</string>|<string moduleConfig=\"true\" name=\"CodePushDeploymentKey\">${CODEPUSH_KEY_ANDROID}</string>|g" app/src/main/res/values/strings.xml
+
+       if [ "$DEPLOY_VERSION" ]; then
+          VERSION=${DEPLOY_VERSION}
+       else # uses latest tag
+          VERSION=$(git describe --tags $(git rev-list --tags --max-count=1))
+       fi
+
+       sed -i "s|versionName.*|versionName \"${VERSION}\"|g" ../android/app/build.gradle
+       ./gradlew clean && ./gradlew assembleRelease
+       mv ~/project/apps/native-apps/android/app/build/outputs/apk/release/app-release.apk ~/out/release-${DEPLOY_ENV}_${VERSION}_${TIMESTAMP}.apk
+
+   - run:
+      name: Login MS AppCenter
+      command: appcenter login --token ${APPCENTER_TOKEN}
+
+   - run:
+      name: Install sshpass
+      command: |
+       sudo apt-get install sshpass
+   - run:
+      name: Upload APK to MDM server
+      command: |
+       sshpass -p "${MDM_FTP_PASSWORD}" scp -o StrictHostKeyChecking=no ~/out/release-*.apk ${MDM_USER}@${MDM_ADDRESS}:${MDM_PATH}
+
+   - run:
+      name: Deliver to appcenter
+      command: |
+       if [ "$DEPLOY_ENV" = "PROD" ]; then
+          APPCENTER_PROJECT_NAME="Neat-Personal/neat-android-production"
+       elif [ "$DEPLOY_ENV" = "STAGE" ]; then
+          APPCENTER_PROJECT_NAME="Neat-Personal/neat-android-stage"
+       else # uses develop
+          APPCENTER_PROJECT_NAME="Neat-Personal/neat-android-develop"
+       fi
+       appcenter distribute release --app "$APPCENTER_PROJECT_NAME" --file ~/out/release-*.apk --group "App Testers"
+   - store_artifacts:
+      path: ~/out
+
+   - save_cache:
+      name: Save Yarn Package Cache
+      key: yarn-packages-{{ checksum "yarn.lock" }}
+      paths:
+       - ~/project/.yarn/cache
+       - ~/project/.yarn/unplugged
+
+ ios-build-and-distribute:
+  macos:
+   xcode: 15.1.0
+  resource_class: macos.m1.medium.gen1
+
+  environment:
+   DEPLOY_ENV: << pipeline.parameters.environment >>
+   DEPLOY_VERSION: << pipeline.parameters.version >>
+  steps:
+   - checkout:
+      path: ~/project
+
+   - attach_workspace:
+      at: ~/project
+
+   - restore_cache:
+      name: Restore Yarn Package Cache
+      keys:
+       - yarn-packages-{{ checksum "yarn.lock" }}
+
+   - run:
+      name: Install GCloud
+      command: |
+       brew install --cask google-cloud-sdk
+
+   - run:
+      name: Get ENV VARs from GCloud
+      command: |
+       # Get environment name for GCloud
+       if [ "$DEPLOY_ENV" = "PROD" ]; then
+          GCP_ENV="PROD"
+       elif [ "$DEPLOY_ENV" = "STAGE" ]; then
+          GCP_ENV="STAGE"
+       else # uses develop
+          GCP_ENV="DEVELOP"
+       fi
+       ENV_KEY_NAME="${GCP_ENV}_CI_SERVICE_KEY"
+       ENV_PROJECT_ID="${GCP_ENV}_PROJECT_ID"
+       echo ${!ENV_KEY_NAME} > /tmp/key.json
+       gcloud auth activate-service-account --key-file=/tmp/key.json
+       gcloud config set project ${!ENV_PROJECT_ID}
+       gcloud secrets versions access latest --secret="native-deployment-env-vars" > temp_secret.env
+
+   - run:
+      name: Download appcenter
+      command: sudo npm install appcenter-cli -g
+
+   - run:
+      name: build ios
+      command: |
+       cat temp_secret.env >> ~/project/apps/native-apps/.env
+       cd ~
+       mkdir -p out
+       cd project
+       yarn
+       sudo chown -R 501:20 "/Users/distiller/.npm"
+       yarn build:packages
+       cd apps/native-apps
+       yarn ci:postinstall:ios
+       TIMESTAMP=$(date +%s)
+       source ~/project/apps/native-apps/.env
+       plutil -replace "CodePushDeploymentKey" -string "${CODEPUSH_KEY_IOS}" ios/nativeapplications/Info.plist
+       # only changes build number for develop branch builds
+       if [ "$CIRCLE_BRANCH" = "develop" ]; then
+          sed -i '' "s|CURRENT_PROJECT_VERSION = .*|CURRENT_PROJECT_VERSION = ${TIMESTAMP}\;|g" ios/nativeapplications.xcodeproj/project.pbxproj
+       fi
+
+       if [ "$DEPLOY_VERSION" ]; then
+          VERSION=${DEPLOY_VERSION}
+       else # uses latest tag
+          VERSION=$(git describe --tags $(git rev-list --tags --max-count=1))
+       fi
+
+       sed -i '' "s|MARKETING_VERSION = .*|MARKETING_VERSION = ${VERSION//\"/}\;|g" ios/nativeapplications.xcodeproj/project.pbxproj
+
+       cd ios
+
+       # decode certificates
+       mkdir ./iosCertificates
+       echo ${GCP_IOS_Certificates_encoded} > ios_certificates_encoded.txt
+       echo ${distribution_certificate_encoded} > distribution_certificate_encoded.txt
+       echo ${Neat_InHouse_encoded} > Neat_InHouse_encoded.txt
+       base64 -d -i ios_certificates_encoded.txt  -o ./iosCertificates/GCP-IOS-Certificates.p12
+       base64 -d -i distribution_certificate_encoded.txt -o ./iosCertificates/distribution_certificate.p12
+       base64 -d -i Neat_InHouse_encoded.txt -o ./iosCertificates/Neat_InHouse.mobileprovision
+
+       # decode firebase google service file
+       if [ "$DEPLOY_ENV" = "PROD" ]; then
+         echo ${FIREBASE_PROD_GOOGLE_SERVICES_PLIST} > google-services.txt
+         base64 -d -i google-services.txt -o GoogleService-Info.plist
+       elif [ "$DEPLOY_ENV" = "STAGE" ]; then
+         echo ${FIREBASE_STAGE_GOOGLE_SERVICES_PLIST} > google-services.txt
+         base64 -d -i google-services.txt -o GoogleService-Info.plist
+       fi
+
+       # USING FASTLANE
+
+       if [ "$DEPLOY_ENV" = "PROD" ]; then
+          FASTLANE_LANE="production"
+       elif [ "$DEPLOY_ENV" = "STAGE" ]; then
+          FASTLANE_LANE="stage"
+       else # uses develop
+          FASTLANE_LANE="develop"
+       fi
+
+       bundle install
+       bundle exec fastlane $FASTLANE_LANE
+       mv ~/project/apps/native-apps/ios/Neat.ipa ~/out/release-${DEPLOY_ENV}_${VERSION}_${TIMESTAMP}.ipa
+       mv ~/project/apps/native-apps/ios/Neat.app.dSYM.zip ~/out/Neat.app.dSYM.zip
+
+   - run:
+      name: Login MS AppCenter
+      command: appcenter login --token ${APPCENTER_TOKEN}
+
+   - run:
+      name: Install sshpass
+      command: |
+       brew install hudochenkov/sshpass/sshpass
+
+   - run:
+      name: Upload IPA to MDM server
+      command: |
+       sshpass -p "${MDM_FTP_PASSWORD}" scp -o StrictHostKeyChecking=no ~/out/release-*.ipa ${MDM_USER}@${MDM_ADDRESS}:${MDM_PATH}
+
+   - run:
+      name: Deliver to appcenter
+      command: |
+       if [ "$DEPLOY_ENV" = "PROD" ]; then
+          APPCENTER_PROJECT_NAME="Neat-Personal/neat-ios-production"
+       elif [ "$DEPLOY_ENV" = "STAGE" ]; then
+          APPCENTER_PROJECT_NAME="Neat-Personal/neat-ios-stage"
+       else # uses develop
+          APPCENTER_PROJECT_NAME="Neat-Personal/neat-ios-develop"
+       fi
+       appcenter distribute release --app "$APPCENTER_PROJECT_NAME" --file ~/out/release-*.ipa --group "App Testers"
+
+   - store_artifacts:
+      path: ~/out
+
+   - save_cache:
+      name: Save Yarn Package Cache
+      key: yarn-packages-{{ checksum "yarn.lock" }}
+      paths:
+       - ~/project/.yarn/cache
+       - ~/project/.yarn/unplugged
+
+ codepush-validation:
+  docker:
+   - image: cimg/node:20.11.1
+  steps:
+   - checkout:
+      path: ~/project
+
+   - attach_workspace:
+      at: ~/project
+
+   - run:
+      name: Download appcenter
+      command: sudo npm install appcenter-cli -g
+
+   - run:
+      name: Login appcenter
+      command: appcenter login --token ${APPCENTER_TOKEN}
+
+   - run:
+      name: Install dependencies
+      command: |
+       yarn install
+       yarn build:packages
+       cd apps/native-apps
+
+   - run:
+      name: Codepush command
+      command: |
+       COMMIT_HASH=$(git rev-parse --verify HEAD)
+       type -p curl >/dev/null || (sudo apt update && sudo apt install curl -y)
+       curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+       && sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+       && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+       && sudo apt update \
+       && sudo apt install gh -y
+       MERGED_PR=$(gh pr list --search "${COMMIT_HASH}" --state merged)
+       if [[ "${MERGED_PR}" == *codepush* ]]; then
+         if [ "$DEPLOY_ENV" = "PROD" ]; then
+            appcenter codepush release-react -a Neat-Personal/neat-android-production -d Production
+            appcenter codepush release-react -a Neat-Personal/neat-ios-production -d Production
+         elif [ "$DEPLOY_ENV" = "STAGE" ]; then
+            appcenter codepush release-react -a Neat-Personal/neat-android-stage -d Stage
+            appcenter codepush release-react -a Neat-Personal/neat-ios-stage -d Stage
+         else
+            appcenter codepush release-react -a Neat-Personal/neat-android-develop -d Develop
+            appcenter codepush release-react -a Neat-Personal/neat-ios-develop -d Develop
+         fi
+         curl -X POST https://circleci.com/api/v2/workflow/${CIRCLE_WORKFLOW_ID}/cancel -H 'Accept: application/json' -u ${PERSONAL_API_CANCEL_WORKFLOW}
+       fi
+
+ backend-build-and-deploy-develop:
+  executor: gcp-gcr/default
+  steps:
+   - checkout
+   - gcp-gcr/gcr-auth:
+      registry-url: us-docker.pkg.dev
+      gcloud-service-key: ARTIFACT_REGISTRY_SA_KEY
+      google-project-id: PROD_PROJECT_ID
+   - gcp-gcr/build-image:
+      image: dfm-backend
+      no_output_timeout: 20m
+      dockerfile: dockerfile.back-end
+      registry-url: us-docker.pkg.dev/${PROD_PROJECT_ID}/neat-docker
+      tag: latest
+      google-project-id: PROD_PROJECT_ID
+   - gcp-gcr/push-image:
+      digest-path: /tmp/digest.txt
+      image: dfm-backend
+      registry-url: us-docker.pkg.dev/${PROD_PROJECT_ID}/neat-docker
+      tag: latest
+      google-project-id: PROD_PROJECT_ID
+   - run:
+      command: |
+       echo "Digest is: $(</tmp/digest.txt)"
+   # Deploy to Cloud Run (Dev Environment)
+   - deploy-cmd:
+      version: latest
+      environment: DEVELOP
+      application: 'be'
+
+ web-build-stage:
+  executor: gcp-gcr/default
+  steps:
+   - checkout
+   - get-next-variables-cmd:
+      environment: STAGE
+   - gcp-gcr/gcr-auth:
+      registry-url: us-docker.pkg.dev
+      gcloud-service-key: ARTIFACT_REGISTRY_SA_KEY
+      google-project-id: PROD_PROJECT_ID
+   - build-and-push-web-cmd:
+      environment: STAGE
+      image_name: dfm-web-stage
+
+ web-build-uat:
+  executor: gcp-gcr/default
+  steps:
+   - checkout
+   - get-next-variables-cmd:
+      environment: UAT
+   - gcp-gcr/gcr-auth:
+      registry-url: us-docker.pkg.dev
+      gcloud-service-key: ARTIFACT_REGISTRY_SA_KEY
+      google-project-id: PROD_PROJECT_ID
+   - build-and-push-web-cmd:
+      environment: UAT
+      image_name: dfm-web-uat
+
+ web-build-prod:
+  executor: gcp-gcr/default
+  steps:
+   - checkout
+   - get-next-variables-cmd:
+      environment: PROD
+   - gcp-gcr/gcr-auth:
+      registry-url: us-docker.pkg.dev
+      gcloud-service-key: ARTIFACT_REGISTRY_SA_KEY
+      google-project-id: PROD_PROJECT_ID
+   - build-and-push-web-cmd:
+      environment: PROD
+      image_name: dfm-web-prod
+
+ web-build-and-deploy-develop:
+  executor: gcp-gcr/default
+  steps:
+   - checkout
+   - get-next-variables-cmd
+   - gcp-gcr/gcr-auth:
+      registry-url: us-docker.pkg.dev
+      gcloud-service-key: ARTIFACT_REGISTRY_SA_KEY
+      google-project-id: PROD_PROJECT_ID
+   - build-and-push-web-cmd
+   - deploy-cmd:
+      version: latest
+      environment: DEVELOP
+      application: 'fe'
+
+ db-migration:
+  circleci_ip_ranges: true
+  working_directory: /usr/src/app
+  docker:
+   - image: google/cloud-sdk:alpine
+  steps:
+   - db-migration-cmd:
+      environment: << pipeline.parameters.environment >>
+
+ semantic-release:
+  docker:
+   - image: node:18
+  steps:
+   - checkout
+   - run:
+      name: Semantic Release
+      command: |
+       npm install semantic-release@22.0.12 -g
+       npx semantic-release
+
+ tag-docker-images:
+  executor: gcp-gcr/default
+  steps:
+   - checkout
+   - gcp-gcr/gcr-auth:
+      registry-url: us-docker.pkg.dev
+      gcloud-service-key: ARTIFACT_REGISTRY_SA_KEY
+      google-project-id: PROD_PROJECT_ID
+
+   - run:
+      name: get release version
+      command: |
+       echo "export latest_tag=$(git describe --tags $(git rev-list --tags --max-count=1))" >> ${BASH_ENV}
+
+   - gcp-gcr/tag-image:
+      image: dfm-backend
+      registry-url: us-docker.pkg.dev/${PROD_PROJECT_ID}/neat-docker
+      source-tag: latest
+      target-tag: ${latest_tag}
+      google-project-id: PROD_PROJECT_ID
+
+   - gcp-gcr/tag-image:
+      image: dfm-web-develop
+      registry-url: us-docker.pkg.dev/${PROD_PROJECT_ID}/neat-docker
+      source-tag: latest
+      target-tag: ${latest_tag}
+      google-project-id: PROD_PROJECT_ID
+
+   - gcp-gcr/tag-image:
+      image: dfm-web-stage
+      registry-url: us-docker.pkg.dev/${PROD_PROJECT_ID}/neat-docker
+      source-tag: latest
+      target-tag: ${latest_tag}
+      google-project-id: PROD_PROJECT_ID
+
+   - gcp-gcr/tag-image:
+      image: dfm-web-uat
+      registry-url: us-docker.pkg.dev/${PROD_PROJECT_ID}/neat-docker
+      source-tag: latest
+      target-tag: ${latest_tag}
+      google-project-id: PROD_PROJECT_ID
+
+   - gcp-gcr/tag-image:
+      image: dfm-web-prod
+      registry-url: us-docker.pkg.dev/${PROD_PROJECT_ID}/neat-docker
+      source-tag: latest
+      target-tag: ${latest_tag}
+      google-project-id: PROD_PROJECT_ID
+
+ deploy-backend-to-selected-environment:
+  executor: gcp-gcr/default
+  steps:
+   - deploy-cmd:
+      version: << pipeline.parameters.version >>
+      environment: << pipeline.parameters.environment >>
+      application: 'be'
+
+ deploy-frontend-to-selected-environment:
+  executor: gcp-gcr/default
+  steps:
+   - deploy-cmd:
+      version: << pipeline.parameters.version >>
+      environment: << pipeline.parameters.environment >>
+      application: 'fe'
+
+ run-db-migration:
+  circleci_ip_ranges: true
+  working_directory: /usr/src/app
+  docker:
+   - image: google/cloud-sdk:alpine
+  steps:
+   - db-migration-cmd:
+      environment: << pipeline.parameters.environment >>
+
+ # Job for checking out and merging 'develop' into 'stage'
+ checkout-and-merge:
+    docker:
+      - image: image1:stable  # Specifies the Docker image to use for the job environment
+    steps:
+      - checkout:
+          path: ~/repo  # Clones the repo into the ~/repo directory on the CI runner
+      - run:
+          name: Configure Git  # Configures Git with user email and name
+          command: |
+            git config user.email "${GIT_USER_EMAIL}"  # Set the user email from environment variables
+            git config user.name "${GIT_USER_NAME}"  # Set the user name from environment variables
+      - run:
+          name: Merge Develop into Stage  # Step to merge 'develop' into 'stage'
+          command: |
+            git fetch --no-tags --prune --depth=1 origin develop  # Fetches the latest commits from 'develop'
+            git checkout stage  # Switches to the 'stage' branch
+            git merge origin/develop --allow-unrelated-histories --no-ff -m "Merging develop into stage [skip ci]"  # Merges 'develop' into 'stage'
+            git push origin stage  # Pushes the changes back to the 'stage' branch on the remote repository
+
+  # Job to deploy the 'stage' branch
+ deploy-stage:
+    docker:
+      - image: image1:stable  # Specifies the Docker image to use for the job environment
+    steps:
+      - checkout:
+          path: ~/repo  # Clones the repo into the ~/repo directory on the CI runner
+      - run:
+          name: Deploy to Stage  # Step to deploy the 'stage' branch
+          command: ./deploy-stage.sh  # Executes the deployment script assumed to handle deployment(check project root directory for file location)    
+
+workflows:
+ setup-path-filtering:
+  when:
+   and: # All must be true to trigger
+    - equal: [develop, << pipeline.git.branch >>]
+    - << pipeline.parameters.run-setup >>
+  jobs:
+   - path-filtering/filter:
+      base-revision: develop
+      config-path: .circleci/config.yml
+      mapping: |
+       apps/native-apps/.* native true
+       apps/back-end/.* backend true
+       apps/web/.* web true
+       packages/prisma-config/.* migration true
+       .* run-setup false
+
+ native:
+  when: << pipeline.parameters.native >>
+  jobs:
+   - codepush-validation
+   - android-build-and-distribute:
+      requires:
+       - codepush-validation
+   - ios-build-and-distribute:
+      requires:
+       - codepush-validation
+
+ web:
+  when: << pipeline.parameters.web >>
+  jobs:
+   - web-build-and-deploy-develop
+
+ backend:
+  when: << pipeline.parameters.backend >>
+  jobs:
+   - backend-build-and-deploy-develop
+
+ migration:
+  when: << pipeline.parameters.migration >>
+  jobs:
+   - db-migration
+
+ release and tag docker images:
+  when:
+   and: # All must be true to trigger
+    - equal: [stage, << pipeline.git.branch >>]
+  jobs:
+   - web-build-stage
+   - web-build-uat
+   - web-build-prod
+   - semantic-release:
+      requires:
+       - web-build-stage
+       - web-build-uat
+       - web-build-prod
+   - tag-docker-images:
+      requires:
+       - semantic-release
+
+ deploy-backend:
+  when:
+   and:
+    - equal: [<< pipeline.trigger_source >>, 'api']
+    - equal: [<< pipeline.parameters.app >>, 'be']
+  jobs:
+   - run-db-migration
+   - deploy-backend-to-selected-environment:
+      requires:
+       - run-db-migration
+
+ deploy-frontend:
+  when:
+   and:
+    - equal: [<< pipeline.trigger_source >>, 'api']
+    - equal: [<< pipeline.parameters.app >>, 'fe']
+  jobs:
+   - deploy-frontend-to-selected-environment
+
+ build-and-deploy:
+    jobs:
+      - checkout-and-merge:
+          filters:
+            branches:
+              only: 
+                - develop  # Ensures this job only runs for changes to the 'develop' branch
+      - deploy-stage:
+          requires:
+            - checkout-and-merge  # Specifies that 'deploy-stage' can only run after 'checkout-and-merge' completes successfully
+          filters:
+            branches:
+              only:
+                - stage  # Ensures this job only runs for changes to the 'stage' branch
+
+ schedule:
+    triggers:
+      - schedule:
+          cron: "30 6 * * 3"  # At 06:30 on Wednesday (UTC)
+          filters:
+            branches:
+              only:
+                - develop
+    jobs:
+      - checkout-and-merge           
+
+
+
+ 
